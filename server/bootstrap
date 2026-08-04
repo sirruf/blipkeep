@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
 #
-# Развёртывание панели tinymon из одного образа, без исходников.
+# Deploy the Blipkeep panel from a single image, without sources.
 #
 #   docker run --rm sirruf/tinymon-server:latest cat /app/bin/bootstrap \
 #     | bash -s -- --host mon.example.com
 #
-# Скрипт выполняется на хосте, а не внутри контейнера: он достаёт манифест
-# стека из образа, генерирует .env с секретами и разворачивает стек Swarm.
-# Всё остальное — миграции, правила алертов по умолчанию, первый
-# администратор — делает сам контейнер при старте (rel/overlays/bin/server).
+# The script runs on the host, not inside the container: it pulls the stack
+# manifest out of the image, generates .env with secrets and deploys the Swarm
+# stack. Everything else — migrations, default alert rules, the first
+# administrator — the container does itself on start (rel/overlays/bin/server).
 #
-# Повторный запуск безопасен: существующий .env не перезаписывается,
-# а Tinymon.Release.setup/0 идемпотентна.
+# Running it again is safe: an existing .env is never overwritten and
+# Tinymon.Release.setup/0 is idempotent.
 #
-# Сообщения — на русском или английском: язык берётся из TINYMON_LANG,
-# иначе из локали системы. Ставить панель может и тот, кто по-русски
-# не читает, а вывод установщика — половина инструкции.
+# English only, deliberately: this file is published as part of the public
+# installation kit, and the panel is installed by people who do not
+# necessarily read Russian. The Russian walkthrough lives in the docs.
 
 set -euo pipefail
 
@@ -29,22 +29,9 @@ ADMIN_EMAIL=""
 SCHEME="https"
 PORT="4000"
 
-# ---- Язык сообщений --------------------------------------------------------
-
-case "${TINYMON_LANG:-${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}}" in
-  en*|C|POSIX) MSG_LANG="en" ;;
-  *)           MSG_LANG="ru" ;;
-esac
-
-# t <русский текст> <english text>
-t() {
-  if [[ "$MSG_LANG" == "en" ]]; then printf '%s' "$2"; else printf '%s' "$1"; fi
-}
-
 usage() {
-  if [[ "$MSG_LANG" == "en" ]]; then
-    cat >&2 <<'EOF'
-Deploying the tinymon panel from an image.
+  cat >&2 <<'EOF'
+Deploy the Blipkeep panel from an image.
 
   --host <address>       panel address: goes into links and the agent install command
   --admin <email>        first administrator's email (default: admin@<host>)
@@ -55,21 +42,6 @@ Deploying the tinymon panel from an image.
   --dir <path>           deployment directory (default: /opt/tinymon)
   --stack <name>         Swarm stack name (default: tinymon)
 EOF
-  else
-    cat >&2 <<'EOF'
-Развёртывание панели tinymon из образа.
-
-  --host <адрес>      адрес панели, входит в ссылки и в команду установки агента
-  --admin <почта>     адрес первого администратора (по умолчанию admin@<host>)
-  --scheme <https|http>  схема в ссылках (по умолчанию https)
-  --port <порт>       внешний порт панели (по умолчанию 4000)
-  --image <образ>     образ сервера (по умолчанию sirruf/tinymon-server)
-  --version <тег>     версия образа (по умолчанию latest)
-  --dir <путь>        каталог развёртывания (по умолчанию /opt/tinymon)
-  --stack <имя>       имя стека Swarm (по умолчанию tinymon)
-EOF
-  fi
-
   exit 1
 }
 
@@ -84,81 +56,78 @@ while [[ $# -gt 0 ]]; do
     --dir)     DIR="$2";         shift 2 ;;
     --stack)   STACK_NAME="$2";  shift 2 ;;
     -h|--help) usage ;;
-    *) echo "$(t "неизвестный параметр" "unknown option"): $1" >&2; usage ;;
+    *) echo "unknown option: $1" >&2; usage ;;
   esac
 done
 
-[[ -n "$HOST" ]] || { echo "$(t "укажите --host" "--host is required")" >&2; usage; }
+[[ -n "$HOST" ]] || { echo "--host is required" >&2; usage; }
 
 ADMIN_EMAIL="${ADMIN_EMAIL:-admin@${HOST}}"
 
-# ---- Проверки окружения ----------------------------------------------------
+# ---- Environment checks ----------------------------------------------------
 
 [[ $EUID -eq 0 ]] || {
-  echo "$(t "требуются права root: запустите через sudo" \
-           "root privileges required: run through sudo")" >&2
+  echo "root privileges required: run through sudo" >&2
   exit 1
 }
 
 for tool in docker openssl; do
   command -v "$tool" >/dev/null 2>&1 || {
-    echo "$(t "нужен $tool, но его нет" "$tool is required but missing")" >&2
+    echo "$tool is required but missing" >&2
     exit 1
   }
 done
 
-# Swarm обязателен: манифест — stack.yml, а не compose. Инициализация
-# автоматическая, но на хосте с несколькими адресами Docker не может выбрать
-# сам — тогда показываем точную команду вместо того, чтобы гадать
+# Swarm is required: the manifest is a stack.yml, not a compose file. It is
+# initialised automatically, but on a host with several addresses Docker cannot
+# choose one — there we print the exact command instead of guessing
 if [[ "$(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null)" != "active" ]]; then
-  echo "==> $(t "Swarm не инициализирован, инициализирую" \
-                "Swarm is not initialised, initialising")"
+  echo "==> Swarm is not initialised, initialising"
 
   if ! docker swarm init >/dev/null 2>&1; then
-    echo "    $(t "не удалось выбрать адрес автоматически." \
-                  "could not pick an address automatically.")" >&2
-    echo "    $(t "Выполните вручную и повторите запуск:" \
-                  "Run this manually and try again:")" >&2
+    echo "    could not pick an address automatically." >&2
+    echo "    Run this manually and try again:" >&2
     echo "      docker swarm init --advertise-addr <address>" >&2
     exit 1
   fi
 fi
 
-# ---- Образ -----------------------------------------------------------------
+# ---- Image -----------------------------------------------------------------
 
-echo "==> $(t "тяну" "pulling") ${IMAGE}:${VERSION}"
+echo "==> pulling ${IMAGE}:${VERSION}"
 
-# Заранее: если тега нет или нет доступа в реестр, узнаём об этом до того,
-# как что-то создано на диске
+# Up front: if the tag is missing or the registry is unreachable, we find out
+# before anything has been created on disk
 docker pull "${IMAGE}:${VERSION}"
 
 mkdir -p "$DIR"
 cd "$DIR"
 
-echo "==> $(t "достаю манифест стека из образа" "extracting the stack manifest from the image")"
+echo "==> extracting the stack manifest from the image"
 
-# Версия в пути релиза меняется, поэтому глоб раскрывается внутри контейнера
+# The version in the release path changes, so the glob is expanded inside
+# the container
 docker run --rm "${IMAGE}:${VERSION}" \
   sh -c 'cat /app/lib/tinymon-*/priv/deploy/stack.yml' > stack.yml
 
 [[ -s stack.yml ]] || {
-  echo "$(t "манифест пуст — образ собран без priv/deploy" \
-           "the manifest is empty — the image was built without priv/deploy")" >&2
+  echo "the manifest is empty — the image was built without priv/deploy" >&2
   exit 1
 }
 
-# ---- Окружение -------------------------------------------------------------
+# ---- Environment -----------------------------------------------------------
 
-# Существующий .env не трогаем: в нём уже рабочие секреты, и перезапись
-# обесценила бы сессии и оторвала сервер от его же базы
+# An existing .env is left alone: it already holds working secrets, and
+# overwriting it would invalidate every session and cut the server off from
+# its own database
 if [[ -f .env ]]; then
-  echo "==> $(t ".env уже есть, оставляю без изменений" ".env already exists, leaving it as is")"
+  echo "==> .env already exists, leaving it as is"
 else
-  echo "==> $(t "генерирую .env" "generating .env")"
+  echo "==> generating .env"
 
   umask 077
   cat > .env <<EOF
-# $(t "Создано bootstrap" "Created by bootstrap") $(date -Iseconds)
+# Created by bootstrap $(date -Iseconds)
 PHX_HOST=${HOST}
 PHX_SCHEME=${SCHEME}
 POSTGRES_PASSWORD=$(openssl rand -base64 32 | tr -d '/+=' | head -c 32)
@@ -176,22 +145,22 @@ set -a
 source .env
 set +a
 
-# Переданные флаги важнее того, что записано в .env: иначе повторный запуск
-# с другой версией молча развернул бы старую
+# Flags win over whatever is written in .env: otherwise running this again with
+# a different version would silently deploy the old one
 export TINYMON_IMAGE="$IMAGE"
 export TINYMON_VERSION="$VERSION"
 
-# ---- Развёртывание ---------------------------------------------------------
+# ---- Deployment ------------------------------------------------------------
 
-echo "==> $(t "разворачиваю стек" "deploying stack") $STACK_NAME"
+echo "==> deploying stack $STACK_NAME"
 
-# --with-registry-auth нужен для приватного реестра: без него узел не получит
-# учётные данные и не скачает образ. Для публичного образа он безвреден
+# --with-registry-auth matters for a private registry: without it the node
+# gets no credentials and cannot pull. Harmless for a public image
 docker stack deploy --with-registry-auth -c stack.yml "$STACK_NAME"
 
-# Готовность базы проверяется её собственным pg_isready, а не наличием
-# контейнера: процесс запускается задолго до того, как принимает соединения
-echo "==> $(t "жду базу" "waiting for the database")"
+# Database readiness is checked with its own pg_isready rather than by the
+# presence of a container: the process starts long before it accepts connections
+echo "==> waiting for the database"
 
 attempts=0
 while :; do
@@ -199,73 +168,68 @@ while :; do
 
   if [[ -n "$container" ]] && \
      docker exec "$container" pg_isready -U tinymon -d tinymon >/dev/null 2>&1; then
-    echo "    $(t "база готова" "database is ready")"
+    echo "    database is ready"
     break
   fi
 
   attempts=$((attempts + 1))
 
-  # 10 минут: столько может занять скачивание образа TimescaleDB
+  # 10 minutes: that is how long pulling the TimescaleDB image can take
   if [[ $attempts -gt 300 ]]; then
-    echo "    $(t "база не поднялась за 10 минут" "the database did not come up within 10 minutes")" >&2
+    echo "    the database did not come up within 10 minutes" >&2
     docker service ps "${STACK_NAME}_db" --no-trunc | head -5 >&2
     exit 1
   fi
 
-  [[ $((attempts % 15)) -ne 0 ]] || \
-    echo "    $(t "ждём базу" "still waiting") ($((attempts * 2)) s)..."
+  [[ $((attempts % 15)) -ne 0 ]] || echo "    still waiting ($((attempts * 2)) s)..."
   sleep 2
 done
 
-echo "==> $(t "жду сервер" "waiting for the server")"
+echo "==> waiting for the server"
 
 attempts=0
 until [[ "$(docker service ls --filter "name=${STACK_NAME}_tinymon" --format '{{.Replicas}}' | cut -d/ -f1)" == "1" ]]; do
   attempts=$((attempts + 1))
 
   if [[ $attempts -gt 90 ]]; then
-    echo "    $(t "сервис не поднялся, смотрите" "the service did not start, check") docker service logs ${STACK_NAME}_tinymon" >&2
+    echo "    the service did not start, check docker service logs ${STACK_NAME}_tinymon" >&2
     exit 1
   fi
 
   sleep 2
 done
 
-# ---- Учётные данные --------------------------------------------------------
+# ---- Credentials -----------------------------------------------------------
 
-# Пароль первого администратора лежит в файле внутри контейнера, а не в
-# журнале: журнал остаётся на диске узла до ротации и уезжает в сборщик логов,
-# а прочитать его может всякий, у кого есть доступ к докеру
+# The first administrator's password lives in a file inside the container, not
+# in the log: the log stays on the node's disk until rotation, travels to log
+# collectors, and anyone with docker access can read it
 container="$(docker ps -q -f "name=${STACK_NAME}_tinymon" | head -1)"
 credentials_in_container="/app/.initial-credentials"
 
 if [[ -n "$container" ]] && docker exec "$container" test -f "$credentials_in_container" 2>/dev/null; then
   {
-    echo "# $(t "Учётные данные первого администратора tinymon" \
-                "tinymon first administrator credentials")"
-    echo "# $(t "Создано:" "Created:") $(date -Iseconds)"
-    echo "# $(t "Смените пароль при первом входе и удалите этот файл." \
-                "Change the password on first sign-in and delete this file.")"
+    echo "# Blipkeep first administrator credentials"
+    echo "# Created: $(date -Iseconds)"
+    echo "# Change the password on first sign-in and delete this file."
     echo
     docker exec "$container" cat "$credentials_in_container"
   } > "$DIR/.initial-credentials"
 
   chmod 600 "$DIR/.initial-credentials"
 
-  # Внутри контейнера файл больше не нужен
+  # The file is no longer needed inside the container
   docker exec "$container" rm -f "$credentials_in_container" 2>/dev/null || true
 
   echo
-  echo "    $(t "учётные данные записаны в" "credentials written to") $DIR/.initial-credentials (0600)"
+  echo "    credentials written to $DIR/.initial-credentials (0600)"
 else
-  echo "    $(t "администратор уже существовал, пароль не менялся" \
-                "the administrator already existed, the password was left alone")"
+  echo "    the administrator already existed, the password was left alone"
 fi
 
-# ---- Итог ------------------------------------------------------------------
+# ---- Summary ---------------------------------------------------------------
 
-if [[ "$MSG_LANG" == "en" ]]; then
-  cat <<EOF
+cat <<EOF
 
 ==> done
 
@@ -279,19 +243,3 @@ if [[ "$MSG_LANG" == "en" ]]; then
 
     To move to another version, run this again with --version <tag>.
 EOF
-else
-  cat <<EOF
-
-==> готово
-
-    панель:   ${SCHEME}://${HOST}
-    каталог:  ${DIR}
-    версия:   ${IMAGE}:${VERSION}
-
-    Токен для установки агента:
-      docker exec \$(docker ps -q -f name=${STACK_NAME}_tinymon | head -1) \\
-        /app/bin/tinymon eval 'Tinymon.Release.enrollment_token()'
-
-    Обновление на другую версию — повторный запуск с --version <тег>.
-EOF
-fi

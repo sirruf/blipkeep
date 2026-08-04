@@ -80,9 +80,9 @@ The kit contains everything except the Docker images themselves — bring them
 separately. On a machine with internet access:
 
 ```bash
-docker pull sirruf/tinymon-server:0.7.29
+docker pull sirruf/tinymon-server:0.7.31
 docker pull timescale/timescaledb-ha:pg17
-docker save sirruf/tinymon-server:0.7.29 timescale/timescaledb-ha:pg17 \
+docker save sirruf/tinymon-server:0.7.31 timescale/timescaledb-ha:pg17 \
   | gzip > blipkeep-images.tar.gz
 ```
 
@@ -92,7 +92,7 @@ On the panel server, before running bootstrap:
 gunzip -c blipkeep-images.tar.gz | sudo docker load
 ```
 
-Then install with an explicit version (`--version 0.7.29`) rather than
+Then install with an explicit version (`--version 0.7.31`) rather than
 `latest`: there will be nowhere to pull that tag from. Monitored servers need
 no internet at all — only access to the panel.
 
@@ -171,7 +171,7 @@ must time out. `ufw status` will not tell you the truth here.
 With the kit copied to the server:
 
 ```bash
-scp -r blipkeep-install-kit-0.7.29-en root@203.0.113.10:/root/blipkeep
+scp -r blipkeep-install-kit-0.7.31-en root@203.0.113.10:/root/blipkeep
 ssh root@203.0.113.10 'cd /root/blipkeep && ./install.sh --host mon.example.com'
 ```
 
@@ -460,7 +460,7 @@ upstream panel only displays them.
 The panel:
 
 ```bash
-cd /opt/tinymon && sudo ./update.sh 0.7.29     # or: --current
+cd /opt/tinymon && sudo ./update.sh 0.7.31     # or: --current
 ```
 
 The script pulls the image and updates the service; the database and settings
@@ -471,7 +471,7 @@ Without the kit, re-running bootstrap does the same:
 
 ```bash
 docker run --rm sirruf/tinymon-server:latest cat /app/bin/bootstrap \
-  | sudo bash -s -- --host mon.example.com --version 0.7.29
+  | sudo bash -s -- --host mon.example.com --version 0.7.31
 ```
 
 Since 0.7.26 the panel learns about new versions on its own and updates itself
