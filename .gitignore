@@ -1,0 +1,14 @@
+# Anything a real installation creates in this directory must never be
+# committed: .env holds the database password and the session signing key,
+# .initial-credentials holds the first administrator's password.
+.env
+.env.*
+!.env.example
+.initial-credentials
+*.key
+*.pem
+
+# Docker image bundles made for air-gapped transfers
+*.tar.gz
+
+.DS_Store

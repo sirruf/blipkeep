@@ -1,0 +1,165 @@
+# Клиентская инсталляция tinymon как стек Docker Swarm.
+#
+#   docker stack deploy -c stack.yml --with-registry-auth tinymon
+#
+# Файл лежит в server/priv/, а не в deploy/, намеренно: оттуда он попадает
+# внутрь образа сервера и панель разворачивается одним образом, без исходников
+#
+#   docker run --rm <образ> cat /app/bin/bootstrap | bash -s -- --host <адрес>
+#
+# Тот же файл используют deploy/deploy.sh и bootstrap — копии не расходятся.
+#
+# Переменные берутся из .env — заполните его по .env.example.
+
+version: "3.8"
+
+services:
+  tinymon:
+    image: ${TINYMON_IMAGE:-tinymon-server}:${TINYMON_VERSION:-latest}
+
+    environment:
+      DATABASE_URL: postgres://tinymon:${POSTGRES_PASSWORD}@db:5432/tinymon
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE}
+      PHX_HOST: ${PHX_HOST}
+      PORT: "4000"
+      # Схема в ссылках, которые уходят в Telegram: за реверс-прокси она
+      # отличается от той, по которой сервер слушает
+      PHX_SCHEME: ${PHX_SCHEME:-http}
+      # Порт в ссылках. При https без него подставляется 443, а панель со
+      # своим TLS обычно слушает тот же порт, что и раньше — из-за этого
+      # команда самообновления уходила агентам с адресом без порта
+      PHX_URL_PORT: ${PHX_URL_PORT:-}
+      TINYMON_ADMIN_EMAIL: ${ADMIN_EMAIL}
+      # Заголовок с адресом клиента, которому можно верить. Заполняется только
+      # там, где перед панелью стоит прокси, этот заголовок перезаписывающий:
+      # иначе клиент задаёт себе адрес сам и обходит ограничитель частоты
+      TINYMON_CLIENT_IP_HEADER: ${TINYMON_CLIENT_IP_HEADER:-}
+      # Собственный TLS вместо реверс-прокси. Пути указывают внутрь контейнера,
+      # каталог с сертификатом монтируется ниже. Пусто — обычный http.
+      TINYMON_TLS_CERTFILE: ${TINYMON_TLS_CERTFILE:-}
+      TINYMON_TLS_KEYFILE: ${TINYMON_TLS_KEYFILE:-}
+
+    ports:
+      - target: 4000
+        published: ${PUBLISHED_PORT:-4000}
+        protocol: tcp
+        # host, а не ingress: ingress-сеть Swarm подменяет адрес источника
+        # на внутренний, и в заявке на аппрув вместо IP агента был бы
+        # адрес маршрутизатора overlay-сети
+        mode: host
+
+    # Каталог с сертификатом монтируется всегда, но пустым он ни на что не
+    # влияет: TLS включают переменные TINYMON_TLS_*. Так манифест остаётся
+    # общим для установок с прокси и без него.
+    volumes:
+      - type: bind
+        source: ${TINYMON_TLS_DIR:-/etc/tinymon-tls}
+        target: /etc/tinymon-tls
+        read_only: true
+
+    networks:
+      - internal
+
+    deploy:
+      replicas: 1
+      # Одна реплика намеренно: несколько экземпляров движка алертов
+      # оценивали бы правила параллельно и дублировали уведомления
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: any
+        delay: 10s
+      update_config:
+        order: stop-first
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 256M
+
+    healthcheck:
+      test: ["CMD-SHELL", "/app/bin/tinymon rpc 'IO.puts(:ok)' > /dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  db:
+    image: timescale/timescaledb-ha:pg17
+
+    environment:
+      POSTGRES_USER: tinymon
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: tinymon
+      # Контрольные точки реже: поток метрик даёт постоянную запись,
+      # и агрессивный checkpoint без нужды нагружает диск
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+
+    command:
+      - postgres
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - effective_cache_size=2GB
+      - -c
+      - maintenance_work_mem=256MB
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - wal_compression=on
+      - -c
+      - max_connections=100
+      # Фоновые задания TimescaleDB: компрессия и обновление агрегатов
+      - -c
+      - timescaledb.max_background_workers=8
+
+    volumes:
+      - db_data:/home/postgres/pgdata/data
+
+    networks:
+      - internal
+
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: any
+        delay: 10s
+      resources:
+        limits:
+          memory: 3G
+        reservations:
+          memory: 512M
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tinymon -d tinymon"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  internal:
+    driver: overlay
+    # Внутренняя сеть без выхода наружу не подходит: серверу нужен доступ
+    # к api.telegram.org для уведомлений
+    attachable: false
+
+volumes:
+  db_data:
+    driver: local
